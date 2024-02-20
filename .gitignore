@@ -13,9 +13,9 @@ StegaStamp/
 wm_*.py
 *.ipynb
 
-# Except example.ipynb
+# Except 
 !example.ipynb
-
+!example/config/
 
 ################## Template #####################
 # Byte-compiled / optimized / DLL files
