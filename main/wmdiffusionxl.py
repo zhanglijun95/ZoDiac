@@ -1,4 +1,4 @@
-from typing import Callable, List, Optional, Union, Any, Dict
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from functools import partial
 import numpy as np
 import copy
@@ -7,7 +7,7 @@ import PIL
 
 import torch
 from torch.utils.checkpoint import checkpoint
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionXLPipeline
 from diffusers.utils import BaseOutput
 
 
@@ -17,25 +17,27 @@ class ModifiedStableDiffusionPipelineOutput(BaseOutput):
     nsfw_content_detected: Optional[List[bool]]
     init_latents: Optional[torch.FloatTensor]
 
-class WatermarkStableDiffusionPipeline(StableDiffusionPipeline):
+class WatermarkStableDiffusionPipeline(StableDiffusionXLPipeline):
     def __init__(self,
         vae,
         text_encoder,
+        text_encoder_2,
         tokenizer,
+        tokenizer_2,
         unet,
         scheduler,
-        safety_checker,
-        feature_extractor,
-        requires_safety_checker: bool = True,
+        force_zeros_for_empty_prompt = True,
+        add_watermarker = None,
     ):
         super(WatermarkStableDiffusionPipeline, self).__init__(vae,
                 text_encoder,
+                text_encoder_2,
                 tokenizer,
+                tokenizer_2,
                 unet,
                 scheduler,
-                safety_checker,
-                feature_extractor,
-                requires_safety_checker)
+                force_zeros_for_empty_prompt,
+                add_watermarker)
     
     # Generate image in tensor format
     def decode_latents_tensor(self, latents):
@@ -55,28 +57,41 @@ class WatermarkStableDiffusionPipeline(StableDiffusionPipeline):
                             sample: torch.FloatTensor,
                             timestep: Union[torch.Tensor, float, int],
                             encoder_hidden_states: torch.Tensor,
-                            cross_attention_kwargs: Optional[Dict[str, Any]] = None,):
-        return self.unet(sample, timestep, encoder_hidden_states=encoder_hidden_states, cross_attention_kwargs=cross_attention_kwargs)
+                            cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+                            added_cond_kwargs: Optional[Dict[str, Any]] = None,):
+        return self.unet(sample, timestep, encoder_hidden_states=encoder_hidden_states, cross_attention_kwargs=cross_attention_kwargs, added_cond_kwargs=added_cond_kwargs)
     
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
+        prompt_2: Optional[Union[str, List[str]]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
+        denoising_end: Optional[float] = None,
+        guidance_scale: float = 5.0,
         negative_prompt: Optional[Union[str, List[str]]] = None,
+        negative_prompt_2: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-        callback_steps: Optional[int] = 1,
+        callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        guidance_rescale: float = 0.0,
+        original_size: Optional[Tuple[int, int]] = None,
+        crops_coords_top_left: Tuple[int, int] = (0, 0),
+        target_size: Optional[Tuple[int, int]] = None,
+        negative_original_size: Optional[Tuple[int, int]] = None,
+        negative_crops_coords_top_left: Tuple[int, int] = (0, 0),
+        negative_target_size: Optional[Tuple[int, int]] = None,
         ### added parameters
         use_trainable_latents: bool = False,
         init_latents: Optional[torch.FloatTensor] = None,
@@ -153,10 +168,15 @@ class WatermarkStableDiffusionPipeline(StableDiffusionPipeline):
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
+        
+        original_size = original_size or (height, width)
+        target_size = target_size or (height, width)
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
-            prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
+            prompt, prompt_2, height,width,callback_steps,
+            negative_prompt,negative_prompt_2,prompt_embeds,negative_prompt_embeds,
+            pooled_prompt_embeds,negative_pooled_prompt_embeds,
         )
 
         # 2. Define call parameters
@@ -175,27 +195,32 @@ class WatermarkStableDiffusionPipeline(StableDiffusionPipeline):
 
         # 3. Encode input prompt
         with torch.no_grad():
-            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt,
-                device,
-                num_images_per_prompt,
-                do_classifier_free_guidance,
-                negative_prompt,
+            (
+                prompt_embeds,
+                negative_prompt_embeds,
+                pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            ) = self.encode_prompt(
+                prompt=prompt,
+                prompt_2=prompt_2,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                negative_prompt=negative_prompt,
+                negative_prompt_2=negative_prompt_2,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                lora_scale=None,
             )
-        # For classifier free guidance, we need to do two forward passes.
-        # Here we concatenate the unconditional and text embeddings into a single batch
-        # to avoid doing two forward passes
-        if do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
         # 5. Prepare latent variables
-        num_channels_latents = self.unet.in_channels
+        num_channels_latents = self.unet.config.in_channels
         if not use_trainable_latents:
             pre_generated_for_reverse = True if latents is not None else False
             latents = self.prepare_latents(
@@ -218,8 +243,34 @@ class WatermarkStableDiffusionPipeline(StableDiffusionPipeline):
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 7. Denoising loop
+        # 7. Prepare added time ids & embeddings
+        add_text_embeds = pooled_prompt_embeds
+        add_time_ids = self._get_add_time_ids(
+            original_size, crops_coords_top_left, target_size, dtype=prompt_embeds.dtype
+        )
+        if negative_original_size is not None and negative_target_size is not None:
+            negative_add_time_ids = self._get_add_time_ids(
+                negative_original_size,
+                negative_crops_coords_top_left,
+                negative_target_size,
+                dtype=prompt_embeds.dtype,
+            )
+        else:
+            negative_add_time_ids = add_time_ids
+
+        if do_classifier_free_guidance:
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+            add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+
+        prompt_embeds = prompt_embeds.to(device)
+        add_text_embeds = add_text_embeds.to(device)
+        add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+        
+        
+        # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -227,15 +278,17 @@ class WatermarkStableDiffusionPipeline(StableDiffusionPipeline):
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
+                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
                 if not use_trainable_latents and not pre_generated_for_reverse:
                     noise_pred = self.unet(
                         latent_model_input,
                         t,
                         encoder_hidden_states=prompt_embeds,
                         cross_attention_kwargs=cross_attention_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
                     ).sample
                 else:
-                    noise_pred = checkpoint(self.unet_custom_forward, latent_model_input, t, prompt_embeds, cross_attention_kwargs).sample
+                    noise_pred = checkpoint(self.unet_custom_forward, latent_model_input, t, prompt_embeds, cross_attention_kwargs, added_cond_kwargs).sample
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -279,149 +332,3 @@ class WatermarkStableDiffusionPipeline(StableDiffusionPipeline):
 
         return ModifiedStableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept, init_latents=init_latents)
 
-class WMDetectStableDiffusionPipeline(WatermarkStableDiffusionPipeline):
-    def __init__(self,
-        vae,
-        text_encoder,
-        tokenizer,
-        unet,
-        scheduler,
-        safety_checker,
-        feature_extractor,
-        requires_safety_checker: bool = True,
-    ):
-        super(WMDetectStableDiffusionPipeline, self).__init__(vae,
-                text_encoder,
-                tokenizer,
-                unet,
-                scheduler,
-                safety_checker,
-                feature_extractor,
-                requires_safety_checker)
-        self.forward_diffusion = partial(self.backward_diffusion, reverse_process=True)
-
-    ######### From Tree-Rings repo, for inverse diffusion model ########
-    @torch.inference_mode()
-    def get_text_embedding(self, prompt):
-        text_input_ids = self.tokenizer(
-            prompt,
-            padding="max_length",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids
-        text_embeddings = self.text_encoder(text_input_ids.to(self.device))[0]
-        return text_embeddings
-    
-    # The reverse of decode_latents_tensor()
-    @torch.inference_mode()
-    def get_image_latents(self, image: torch.Tensor, sample=True, rng_generator=None):
-        image = 2.0 * image - 1.0
-        encoding_dist = self.vae.encode(image).latent_dist
-        if sample:
-            encoding = encoding_dist.sample(generator=rng_generator)
-        else:
-            encoding = encoding_dist.mode()
-        latents = encoding * self.vae.config.scaling_factor
-        return latents
-
-    def backward_ddim(self, x_t, alpha_t, alpha_tm1, eps_xt):
-        """ from noise to image"""
-        return (
-            alpha_tm1**0.5
-            * (
-                (alpha_t**-0.5 - alpha_tm1**-0.5) * x_t
-                + ((1 / alpha_tm1 - 1) ** 0.5 - (1 / alpha_t - 1) ** 0.5) * eps_xt
-            )
-            + x_t
-        )
-    
-    @torch.inference_mode()
-    def backward_diffusion(
-        self,
-        use_old_emb_i=25,
-        text_embeddings=None,
-        old_text_embeddings=None,
-        new_text_embeddings=None,
-        latents: Optional[torch.FloatTensor] = None,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-        callback_steps: Optional[int] = 1,
-        reverse_process: True = False,
-        **kwargs,
-    ):
-        """ Generate image from text prompt and latents
-        """
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = guidance_scale > 1.0
-        # set timesteps
-        self.scheduler.set_timesteps(num_inference_steps)
-        # Some schedulers like PNDM have timesteps as arrays
-        # It's more optimized to move all timesteps to correct device beforehand
-        timesteps_tensor = self.scheduler.timesteps.to(self.device)
-        # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
-
-        if old_text_embeddings is not None and new_text_embeddings is not None:
-            prompt_to_prompt = True
-        else:
-            prompt_to_prompt = False
-
-
-        for i, t in enumerate(self.progress_bar(timesteps_tensor if not reverse_process else reversed(timesteps_tensor))):
-            if prompt_to_prompt:
-                if i < use_old_emb_i:
-                    text_embeddings = old_text_embeddings
-                else:
-                    text_embeddings = new_text_embeddings
-
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = (
-                torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-            )
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-            ############
-            # predict the noise residual
-            noise_pred = self.unet(
-                latent_model_input, t, encoder_hidden_states=text_embeddings
-            ).sample
-            
-            # noise_pred = torch.rand_like(latents, device=self.device)
-            ############
-
-            # perform guidance
-            if do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (
-                    noise_pred_text - noise_pred_uncond
-                )
-
-            prev_timestep = (
-                t
-                - self.scheduler.config.num_train_timesteps
-                // self.scheduler.num_inference_steps
-            )
-            # call the callback, if provided
-            if callback is not None and i % callback_steps == 0:
-                callback(i, t, latents)
-            
-            # ddim 
-            alpha_prod_t = self.scheduler.alphas_cumprod[t]
-            alpha_prod_t_prev = (
-                self.scheduler.alphas_cumprod[prev_timestep]
-                if prev_timestep >= 0
-                else self.scheduler.final_alpha_cumprod
-            )
-            if reverse_process:
-                alpha_prod_t, alpha_prod_t_prev = alpha_prod_t_prev, alpha_prod_t
-            latents = self.backward_ddim(
-                x_t=latents,
-                alpha_t=alpha_prod_t,
-                alpha_tm1=alpha_prod_t_prev,
-                eps_xt=noise_pred,
-            )
-        return latents

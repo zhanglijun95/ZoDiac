@@ -32,7 +32,7 @@ class VAEWMAttacker(WMAttacker):
             raise ValueError('model name not supported')
         self.device = device
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -43,6 +43,8 @@ class VAEWMAttacker(WMAttacker):
             out = self.model(img)
             out['x_hat'].clamp_(0, 1)
             rec = transforms.ToPILImage()(out['x_hat'].squeeze().cpu())
+            if resize_to:
+                rec.resize((128,128))
             rec.save(out_path)
 
 
@@ -51,7 +53,7 @@ class GaussianBlurAttacker(WMAttacker):
         self.kernel_size = kernel_size
         self.sigma = sigma
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -62,10 +64,11 @@ class GaussianBlurAttacker(WMAttacker):
 
 
 class GaussianNoiseAttacker(WMAttacker):
-    def __init__(self, std=0.05):
+    def __init__(self, std=0.05, seed=None):
         self.std = std
+        self.seed = seed
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -74,7 +77,7 @@ class GaussianNoiseAttacker(WMAttacker):
             image = image / 255.0
             # Add Gaussian noise to the image
             noise_sigma = self.std  # Vary this to change the amount of noise
-            noisy_image = random_noise(image, mode='gaussian', var=noise_sigma ** 2)
+            noisy_image = random_noise(image, mode='gaussian', var=noise_sigma ** 2, rng=self.seed)
             # Clip the values to [0, 1] range after adding the noise
             noisy_image = np.clip(noisy_image, 0, 1)
             noisy_image = np.array(255 * noisy_image, dtype='uint8')
@@ -85,7 +88,7 @@ class BM3DAttacker(WMAttacker):
     def __init__(self):
         pass
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -99,7 +102,7 @@ class JPEGAttacker(WMAttacker):
     def __init__(self, quality=80):
         self.quality = quality
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -112,7 +115,7 @@ class BrightnessAttacker(WMAttacker):
     def __init__(self, brightness=0.2):
         self.brightness = brightness
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -127,7 +130,7 @@ class ContrastAttacker(WMAttacker):
     def __init__(self, contrast=0.2):
         self.contrast = contrast
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -143,7 +146,7 @@ class RotateAttacker(WMAttacker):
         self.degree = degree
         self.expand = expand
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -151,6 +154,8 @@ class RotateAttacker(WMAttacker):
             img = Image.open(img_path)
             img = img.rotate(self.degree, expand=self.expand)
             img = img.resize((512,512))
+            if resize_to:
+                img.resize((128,128))
             img.save(out_path)
 
 
@@ -158,7 +163,7 @@ class ScaleAttacker(WMAttacker):
     def __init__(self, scale=0.5):
         self.scale = scale
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -173,7 +178,7 @@ class CropAttacker(WMAttacker):
     def __init__(self, crop_size=0.5):
         self.crop_size = crop_size
 
-    def attack(self, image_paths, out_paths, multi=False):
+    def attack(self, image_paths, out_paths, multi=False, resize_to=False):
         for (img_path, out_path) in tqdm(zip(image_paths, out_paths)):
             if os.path.exists(out_path) and not multi:
                 continue
@@ -193,7 +198,7 @@ class DiffWMAttacker(WMAttacker):
         self.captions = captions
         print(f'Diffuse attack initialized with noise step {self.noise_step} and use prompt {len(self.captions)}')
 
-    def attack(self, image_paths, out_paths, return_latents=False, return_dist=False, multi=False):
+    def attack(self, image_paths, out_paths, return_latents=False, return_dist=False, multi=False, resize_to=False):
         with torch.no_grad():
             generator = torch.Generator(self.device).manual_seed(1024)
             latents_buf = []
@@ -202,7 +207,7 @@ class DiffWMAttacker(WMAttacker):
             timestep = torch.tensor([self.noise_step], dtype=torch.long, device=self.device)
             ret_latents = []
 
-            def batched_attack(latents_buf, prompts_buf, outs_buf):
+            def batched_attack(latents_buf, prompts_buf, outs_buf, resize_to):
                 latents = torch.cat(latents_buf, dim=0)
                 images = self.pipe(prompts_buf,
                                    head_start_latents=latents,
@@ -211,6 +216,8 @@ class DiffWMAttacker(WMAttacker):
                                    generator=generator, )
                 images = images[0]
                 for img, out in zip(images, outs_buf):
+                    if resize_to:
+                        img.resize((128,128))
                     img.save(out)
 
             if len(self.captions) != 0:
@@ -229,6 +236,7 @@ class DiffWMAttacker(WMAttacker):
                     continue
                 
                 img = Image.open(img_path)
+                img = img.resize((512, 512))
                 img = np.asarray(img) / 255
                 img = (img - 0.5) * 2
                 img = torch.tensor(img, dtype=torch.float16, device=self.device).permute(2, 0, 1).unsqueeze(0)
@@ -242,7 +250,7 @@ class DiffWMAttacker(WMAttacker):
                 outs_buf.append(out_path)
                 prompts_buf.append(prompt)
                 if len(latents_buf) == self.BATCH_SIZE:
-                    batched_attack(latents_buf, prompts_buf, outs_buf)
+                    batched_attack(latents_buf, prompts_buf, outs_buf, resize_to)
                     latents_buf = []
                     prompts_buf = []
                     outs_buf = []
@@ -250,6 +258,6 @@ class DiffWMAttacker(WMAttacker):
                     ret_latents.append(latents.cpu())
 
             if len(latents_buf) != 0:
-                batched_attack(latents_buf, prompts_buf, outs_buf)
+                batched_attack(latents_buf, prompts_buf, outs_buf, resize_to)
             if return_latents:
                 return ret_latents

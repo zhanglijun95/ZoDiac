@@ -82,7 +82,36 @@ class GTWatermark():
         x_w = (((reversed_latents_w_fft - target_patch) / sigma_w) ** 2).sum().item()
         p_w = scipy.stats.ncx2.cdf(x=x_w, df=len(target_patch), nc=lambda_w)
         return p_w
+
+class GTWatermarkSpatial(GTWatermark):
+    def __init__(self, device, shape=(1,4,64,64), dtype=torch.float32, w_channel=3, w_radius=10, generator=None):
+        super(GTWatermarkSpatial, self).__init__(device, shape, dtype, w_channel, w_radius, generator)
+
+    def _get_watermarking_pattern(self, gt_init): # in fft space
+        gt_patch = gt_init
+        for i in range(self.w_radius, 0, -1): # from outer circle to inner circle
+            tmp_mask = torch.tensor(self._circle_mask(gt_init.shape[-1], r=i)).to(self.device) # circle mask in bool value
+            gt_patch[:, self.w_channel, tmp_mask] = gt_patch[0, self.w_channel, 0, i].item() # set the value inside the circle to be a value from Gaussian Distribution
+        return gt_patch
+    
+
+    def inject_watermark(self, latents): 
+        return latents * ~(self.watermarking_mask) + self.gt_patch * self.watermarking_mask
+
+    def eval_watermark(self, latents_w):
+        l1_metric = torch.abs(latents_w[self.watermarking_mask] - self.gt_patch[self.watermarking_mask]).mean().item()
+        return l1_metric
+    
+    def tree_ring_p_value(self, latents):
+        target_patch = self.gt_patch[self.watermarking_mask].flatten()
+        reversed_latents_w = latents[self.watermarking_mask].flatten()
         
+        sigma_w = reversed_latents_w.std()
+        lambda_w = (target_patch ** 2 / sigma_w ** 2).sum().item()
+        x_w = (((reversed_latents_w - target_patch) / sigma_w) ** 2).sum().item()
+        p_w = scipy.stats.ncx2.cdf(x=x_w, df=len(target_patch), nc=lambda_w)
+        return p_w    
+
 
 class GTWatermarkMulti(GTWatermark):
     def __init__(self, device, shape=(1,4,64,64), dtype=torch.float32, w_settings={0:[1,5,9], 1:[2,6,10], 2:[3,7], 3:[4,8]}, generator=None):

@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 
 from torchvision.transforms.functional import pil_to_tensor
 from torchvision import transforms
+from diffusers import DDIMInverseScheduler
 import torch
-
 
 def show_images_side_by_side(images, titles=None, figsize=(8,4)):
     """
@@ -49,8 +49,11 @@ def save_img(path, img: torch.Tensor, pipe):
     pil_img.save(path)
     return
 
-def get_img_tensor(img_path, device):
-    img_tensor = pil_to_tensor(Image.open(img_path).convert("RGB"))/255
+def get_img_tensor(img_path, device, size=None):
+    if size is None:
+        img_tensor = pil_to_tensor(Image.open(img_path).convert("RGB"))/255
+    else:
+        img_tensor = pil_to_tensor(Image.open(img_path).resize(size).convert("RGB"))/255
     return img_tensor.unsqueeze(0).to(device)
 
 def create_output_folder(cfgs):
@@ -95,9 +98,12 @@ def eval_lpips(ori_img_path, new_img_path, metric, device):
     return metric(ori_x, new_x).item()
 
 # Detect watermark from one image
-def watermark_prob(img, dect_pipe, wm_pipe, text_embeddings, tree_ring=True, device=torch.device('cuda')):
+def watermark_prob(img, dect_pipe, wm_pipe, text_embeddings, tree_ring=True, device=torch.device('cuda'), size=None):
     if isinstance(img, str):
-        img_tensor = pil_to_tensor(Image.open(img).convert("RGB"))/255
+        if size is None:
+            img_tensor = pil_to_tensor(Image.open(img).convert("RGB"))/255
+        else:
+            img_tensor = pil_to_tensor(Image.open(img).resize(size).convert("RGB"))/255
         img_tensor = img_tensor.unsqueeze(0).to(device)
     elif isinstance(img, torch.Tensor):
         img_tensor = img
@@ -109,5 +115,71 @@ def watermark_prob(img, dect_pipe, wm_pipe, text_embeddings, tree_ring=True, dev
         guidance_scale=1.0,
         num_inference_steps=50,
     )
+    det_prob = wm_pipe.one_minus_p_value(reversed_latents) if not tree_ring else wm_pipe.tree_ring_p_value(reversed_latents)
+    return det_prob
+
+def watermark_prob_nodiffusion(img, dect_pipe, wm_pipe, text_embeddings, tree_ring=True, device=torch.device('cuda')):
+    if isinstance(img, str):
+        img_tensor = pil_to_tensor(Image.open(img).convert("RGB"))/255
+        img_tensor = img_tensor.unsqueeze(0).to(device)
+    elif isinstance(img, torch.Tensor):
+        img_tensor = img
+
+    img_latents = dect_pipe.get_image_latents(img_tensor, sample=False)
+    det_prob = wm_pipe.one_minus_p_value(img_latents) if not tree_ring else wm_pipe.tree_ring_p_value(img_latents)
+    return det_prob
+
+## new helpers ##
+@torch.no_grad()
+def get_text_embedding(pipe, prompt):
+    text_input_ids = pipe.tokenizer(
+        prompt,
+        padding="max_length",
+        truncation=True,
+        max_length=pipe.tokenizer.model_max_length,
+        return_tensors="pt",
+    ).input_ids
+    text_embeddings = pipe.text_encoder(text_input_ids.to(pipe.device))[0]
+    return text_embeddings
+
+# The reverse of decode_latents_tensor()
+@torch.no_grad()
+def get_image_latents(pipe, image: torch.Tensor, sample=True, rng_generator=None):
+    image = 2.0 * image - 1.0
+    encoding_dist = pipe.vae.encode(image).latent_dist
+    if sample:
+        encoding = encoding_dist.sample(generator=rng_generator)
+    else:
+        encoding = encoding_dist.mode()
+    latents = encoding * pipe.vae.config.scaling_factor
+    return latents
+
+def get_init_latent(img_tensor, pipe, curr_scheduler):
+    # DDIM inversion from the given image
+    img_latents = get_image_latents(pipe, img_tensor, sample=False)
+    pipe.scheduler = DDIMInverseScheduler.from_config(curr_scheduler.config)
+    reversed_latents = pipe(
+                            prompt='',
+                            latents=img_latents,
+                            guidance_scale=1,
+                            num_inference_steps=50,
+                            output_type='latent',
+                        )
+    reversed_latents = reversed_latents.images.float()
+    pipe.scheduler = curr_scheduler
+    return reversed_latents
+
+def watermark_prob_new(img, pipe, wm_pipe, tree_ring=True, device=torch.device('cuda'), size=None):
+    if isinstance(img, str):
+        if size is None:
+            img_tensor = pil_to_tensor(Image.open(img).convert("RGB"))/255
+        else:
+            img_tensor = pil_to_tensor(Image.open(img).resize(size).convert("RGB"))/255
+        img_tensor = img_tensor.unsqueeze(0).to(device)
+    elif isinstance(img, torch.Tensor):
+        img_tensor = img
+    
+    curr_scheduler = pipe.scheduler
+    reversed_latents = get_init_latent(img_tensor, pipe, curr_scheduler)
     det_prob = wm_pipe.one_minus_p_value(reversed_latents) if not tree_ring else wm_pipe.tree_ring_p_value(reversed_latents)
     return det_prob
