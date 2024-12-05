@@ -4,7 +4,7 @@ save_img: './example/output/'
 
 # for stable diffusion
 model_id: 'stabilityai/stable-diffusion-xl-base-1.0'
-cache_dir: '/project/pi_huiguan_umass_edu/lijun/lijun_data/diffusion/model/'
+cache_dir: './cache_dir/'
 gen_seed: 0  # the seed for generating gt image; no use for watermarking existing imgs
 empty_prompt: True # whether to use the caption of the image
 
